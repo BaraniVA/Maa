@@ -2,7 +2,7 @@
     "rewrites": [
         {
             "source": "/api/:path*",
-            "destination": "https://maa-backend.onrender.com/api/:path*"
+            "destination": "https://maa-backend-zrd9.onrender.com/api/:path*"
         }
     ]
 }
