@@ -312,7 +312,15 @@ async def handle_patient_message(patient_id: int, message_text: str, bots: dict,
     history = existing_data.get("_history", [])
     history.append({"role": "user", "content": english_text})
 
-    if exchange_count < 4 and state != "extracted":
+    # If conversation was already extracted (pipeline ran), re-open it
+    # so the patient's new message gets a proper follow-up response.
+    if state == "extracted":
+        logger.info(f"Re-opening conversation for {patient['name']} — new message after pipeline")
+        state = "active"
+        # Reset exchange count for the new round (keep history intact)
+        exchange_count = 0
+
+    if exchange_count < 4:
         # Generate follow-up
         response = await generate_followup(patient, history)
         history.append({"role": "assistant", "content": response})
