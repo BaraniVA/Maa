@@ -26,7 +26,7 @@ from backend.database import (
     get_conversation_state,
 )
 from backend.pipeline import handle_patient_message, run_morning_pipeline, run_full_pipeline
-from backend.sarvam import translate_to_english, translate_to_patient
+from backend.sarvam import translate_to_english, translate_to_patient, speech_to_text
 
 logger = logging.getLogger("maa.telegram")
 
@@ -64,13 +64,59 @@ def _init_bots():
             logger.warning(f"No token for {name} bot")
 
 
+async def _transcribe_voice(update: Update) -> tuple[str | None, str]:
+    """Download and transcribe a voice message via Sarvam STT. Returns (transcript, detected_sarvam_lang) or (None, '')."""
+    voice = update.message.voice
+    if not voice:
+        return None, ""
+    try:
+        file = await voice.get_file()
+        audio_bytes = bytes(await file.download_as_bytearray())
+    except Exception as e:
+        logger.error(f"Voice download error: {e}")
+        return None, ""
+
+    chat_id = str(update.message.chat_id)
+    patient = get_patient_by_chat_id(chat_id)
+    lang_hint = patient["language_code"] if patient else ""
+    logger.info(f"Voice msg from chat {chat_id}: duration={voice.duration}s, size={voice.file_size}, mime={voice.mime_type}, lang_hint={lang_hint!r}")
+
+    transcript, detected_lang = await speech_to_text(audio_bytes, lang_hint)
+    if transcript:
+        logger.info(f"Voice transcribed for chat {chat_id} [{detected_lang}]: '{transcript}'")
+    else:
+        logger.warning(f"Voice transcription returned empty for chat {chat_id}")
+    return (transcript or None), detected_lang
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle any incoming private message — registration, conversation, or demo trigger."""
-    if not update.message or not update.message.text:
+    if not update.message:
+        return
+
+    # Handle voice messages — transcribe to text
+    voice_mode = False
+    detected_lang = ""
+    if update.message.voice:
+        text, detected_lang = await _transcribe_voice(update)
+        voice_mode = True
+        if not text:
+            chat_id = str(update.message.chat_id)
+            if bots.get("checkin"):
+                try:
+                    await bots["checkin"].send_message(
+                        chat_id=chat_id,
+                        text="Sorry, I couldn't understand that voice message. Could you try again?",
+                    )
+                except Exception as e:
+                    logger.error(f"Voice fallback msg error: {e}")
+            return
+    elif update.message.text:
+        text = update.message.text.strip()
+    else:
         return
 
     chat_id = str(update.message.chat_id)
-    text = update.message.text.strip()
 
     # Private message handling — check if already registered
     patient = get_patient_by_chat_id(chat_id)
@@ -85,14 +131,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"DEMO MODE: {patient['name']} sent '{text}', triggering pipeline")
                 save_agent_event(patient["id"], "System", "demo_trigger",
                                  f"Demo triggered by {patient['name']}")
-                await run_morning_pipeline(patient["id"], bots, reply_chat_id=chat_id)
+                await run_morning_pipeline(patient["id"], bots, reply_chat_id=chat_id, voice_mode=voice_mode, detected_lang=detected_lang)
             else:
                 # Conversation already active — handle as normal follow-up
-                await handle_patient_message(patient["id"], text, bots, reply_chat_id=chat_id)
+                await handle_patient_message(patient["id"], text, bots, reply_chat_id=chat_id, voice_mode=voice_mode, detected_lang=detected_lang)
             return
         else:
             # Normal mode — handle as conversation, reply to DM
-            await handle_patient_message(patient["id"], text, bots, reply_chat_id=chat_id)
+            await handle_patient_message(patient["id"], text, bots, reply_chat_id=chat_id, voice_mode=voice_mode, detected_lang=detected_lang)
             return
 
     # Not registered — start registration
@@ -147,11 +193,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages in the group chat."""
-    if not update.message or not update.message.text:
+    if not update.message:
+        return
+
+    # Handle voice messages — transcribe to text
+    voice_mode = False
+    detected_lang = ""
+    if update.message.voice:
+        text, detected_lang = await _transcribe_voice(update)
+        voice_mode = True
+        if not text:
+            return  # silently ignore failed transcription in group
+    elif update.message.text:
+        text = update.message.text.strip()
+    else:
         return
 
     user_id = update.message.from_user.id if update.message.from_user else None
-    text = update.message.text.strip()
     group_chat_id = str(update.message.chat_id)
 
     if not user_id:
@@ -167,12 +225,12 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             if not conv or conv.get("state") == "idle":
                 save_agent_event(patient["id"], "System", "demo_trigger",
                                  f"Demo triggered by {patient['name']} in group")
-                await run_morning_pipeline(patient["id"], bots, reply_chat_id=group_chat_id)
+                await run_morning_pipeline(patient["id"], bots, reply_chat_id=group_chat_id, voice_mode=voice_mode, detected_lang=detected_lang)
             else:
                 # Conversation already active — handle as follow-up
-                await handle_patient_message(patient["id"], text, bots, reply_chat_id=group_chat_id)
+                await handle_patient_message(patient["id"], text, bots, reply_chat_id=group_chat_id, voice_mode=voice_mode, detected_lang=detected_lang)
         else:
-            await handle_patient_message(patient["id"], text, bots, reply_chat_id=group_chat_id)
+            await handle_patient_message(patient["id"], text, bots, reply_chat_id=group_chat_id, voice_mode=voice_mode, detected_lang=detected_lang)
         return
 
     # Not registered — try to match by name and register from group
@@ -221,13 +279,13 @@ def build_applications() -> list[Application]:
         app = builder.build()
 
         if name == "checkin":
-            # CheckIn bot handles all incoming messages
+            # CheckIn bot handles text + voice messages
             app.add_handler(MessageHandler(
-                filters.TEXT & filters.ChatType.PRIVATE,
+                (filters.TEXT | filters.VOICE) & filters.ChatType.PRIVATE,
                 handle_message,
             ))
             app.add_handler(MessageHandler(
-                filters.TEXT & filters.ChatType.GROUPS,
+                (filters.TEXT | filters.VOICE) & filters.ChatType.GROUPS,
                 handle_group_message,
             ))
         # Other bots don't need message handlers — they only send

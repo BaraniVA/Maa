@@ -2,6 +2,8 @@
 SQLite database setup, schema creation, and 14-day seed data for 4 patients.
 """
 
+import hashlib
+import secrets
 import sqlite3
 import json
 import random
@@ -23,6 +25,46 @@ def init_db():
     """Create all tables and seed data if patients table is empty."""
     conn = get_connection()
     _create_tables(conn)
+
+    # Add new columns to patients if they don't exist
+    for col, coltype in [("blood_group", "TEXT"), ("phone", "TEXT"), ("address", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE patients ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass
+
+    # Auth tables
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS asha_workers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (worker_id) REFERENCES asha_workers(id)
+        );
+    """)
+    conn.commit()
+
+    # Seed a demo ASHA worker if none exist
+    worker_count = conn.execute("SELECT COUNT(*) as c FROM asha_workers").fetchone()["c"]
+    if worker_count == 0:
+        demo_salt = secrets.token_hex(16)
+        demo_hash = hashlib.pbkdf2_hmac('sha256', 'demo1234'.encode(), demo_salt.encode(), 100000).hex()
+        conn.execute(
+            "INSERT INTO asha_workers (name, email, phone, password_hash, salt) VALUES (?,?,?,?,?)",
+            ("Padmapriya", "demo@maa.in", "9876543210", demo_hash, demo_salt),
+        )
+        conn.commit()
+
     # Seed only if no patients exist
     row = conn.execute("SELECT COUNT(*) as c FROM patients").fetchone()
     if row["c"] == 0:
@@ -478,3 +520,129 @@ def match_patient_by_name(name: str) -> dict | None:
         if name_lower in dict(row)["name"].lower() or dict(row)["name"].lower() in name_lower:
             return dict(row)
     return None
+
+
+# ── Auth helpers ──
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000).hex()
+
+
+def create_asha_worker(name: str, email: str, phone: str, password: str) -> dict | None:
+    conn = get_connection()
+    salt = secrets.token_hex(16)
+    password_hash = _hash_password(password, salt)
+    try:
+        conn.execute(
+            "INSERT INTO asha_workers (name, email, phone, password_hash, salt) VALUES (?,?,?,?,?)",
+            (name, email, phone, password_hash, salt),
+        )
+        conn.commit()
+        worker_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return {"id": worker_id, "name": name, "email": email, "phone": phone}
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None
+
+
+def authenticate_worker(email: str, password: str) -> str | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM asha_workers WHERE email = ?", (email,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    worker = dict(row)
+    password_hash = _hash_password(password, worker["salt"])
+    if password_hash != worker["password_hash"]:
+        conn.close()
+        return None
+    token = secrets.token_hex(32)
+    conn.execute("INSERT INTO sessions (worker_id, token) VALUES (?,?)", (worker["id"], token))
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_worker_by_token(token: str) -> dict | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT w.id, w.name, w.email, w.phone, w.created_at FROM asha_workers w "
+        "JOIN sessions s ON w.id = s.worker_id WHERE s.token = ?",
+        (token,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_session(token: str):
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
+# ── Patient CRUD ──
+
+def create_patient_record(name, weeks, trimester, risk_level="low", language_code="hi",
+                          pregnancy_number=1, blood_group="", phone="", address="", asha_phone="") -> dict:
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO patients (name, weeks, trimester, risk_level, language_code,
+           pregnancy_number, blood_group, phone, address, asha_phone)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (name, weeks, trimester, risk_level, language_code, pregnancy_number,
+         blood_group, phone, address, asha_phone),
+    )
+    conn.commit()
+    patient_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return get_patient_by_id(patient_id)
+
+
+def update_patient(patient_id: int, **kwargs) -> dict | None:
+    conn = get_connection()
+    allowed = {"name", "weeks", "trimester", "risk_level", "language_code",
+               "pregnancy_number", "blood_group", "phone", "address",
+               "asha_phone", "telegram_chat_id"}
+    updates = []
+    values = []
+    for key, val in kwargs.items():
+        if key in allowed:
+            updates.append(f"{key} = ?")
+            values.append(val)
+    if not updates:
+        conn.close()
+        return get_patient_by_id(patient_id)
+    values.append(patient_id)
+    conn.execute(f"UPDATE patients SET {', '.join(updates)} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+    return get_patient_by_id(patient_id)
+
+
+def delete_patient(patient_id: int) -> bool:
+    conn = get_connection()
+    for table in ("daily_logs", "medicine_logs", "prescriptions", "notifications",
+                  "care_plans", "conversation_state"):
+        conn.execute(f"DELETE FROM {table} WHERE patient_id = ?", (patient_id,))
+    conn.execute("DELETE FROM agent_events WHERE patient_id = ?", (patient_id,))
+    conn.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def add_prescription(patient_id: int, medicine_name: str, frequency: str = "daily",
+                     quantity_supplied: int = 30) -> dict:
+    conn = get_connection()
+    supply_date = date.today().isoformat()
+    conn.execute(
+        "INSERT INTO prescriptions (patient_id, medicine_name, frequency, quantity_supplied, supply_date) VALUES (?,?,?,?,?)",
+        (patient_id, medicine_name, frequency, quantity_supplied, supply_date),
+    )
+    conn.commit()
+    rx_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return {"id": rx_id, "patient_id": patient_id, "medicine_name": medicine_name,
+            "frequency": frequency, "quantity_supplied": quantity_supplied, "supply_date": supply_date}

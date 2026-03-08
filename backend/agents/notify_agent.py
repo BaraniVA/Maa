@@ -316,7 +316,23 @@ async def _make_twilio_call(patient: dict, script: str) -> bool:
         return True
 
     except Exception as e:
-        logger.error(f"Twilio call error: {e}")
-        await _send_ntfy(patient, "RED", f"Phone call failed — {script}")
-        return False
+        logger.error(f"Twilio call error (attempt 1): {e}")
+        # Retry once after a short delay for transient network/DNS issues
+        try:
+            import asyncio
+            await asyncio.sleep(3)
+            logger.info(f"Retrying Twilio call for {patient['name']}...")
+            call = client.calls.create(
+                to=ASHA_PHONE_NUMBER,
+                from_=TWILIO_PHONE_NUMBER,
+                twiml=twiml,
+            )
+            logger.info(f"Twilio call placed on retry for {patient['name']}: SID={call.sid}, status={call.status}")
+            save_agent_event(patient["id"], "NotifyAgent", "phone_call",
+                             f"📞 Phone call placed to ASHA worker on retry (SID: {call.sid[:12]}...)")
+            return True
+        except Exception as retry_e:
+            logger.error(f"Twilio call error (attempt 2): {retry_e}")
+            await _send_ntfy(patient, "RED", f"Phone call failed — {script}")
+            return False
 

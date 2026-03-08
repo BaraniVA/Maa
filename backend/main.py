@@ -10,9 +10,10 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from backend.config import DEMO_MODE
@@ -20,7 +21,9 @@ from backend.database import (
     init_db, get_all_patients, get_patient_by_id,
     get_daily_logs, get_medicine_logs, get_prescriptions,
     get_care_plans, get_notifications, get_agent_events,
-    get_conversation_state,
+    get_conversation_state, create_asha_worker, authenticate_worker,
+    get_worker_by_token, delete_session, create_patient_record,
+    update_patient, delete_patient, add_prescription,
 )
 from backend.pipeline import pipeline_events, run_full_pipeline, run_morning_pipeline
 from backend.scheduler import setup_scheduler
@@ -230,3 +233,131 @@ async def serve_audio(filename: str):
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="Audio not found")
     return FileResponse(filepath, media_type="audio/wav")
+
+
+# ── Auth Models & Endpoints ──
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    phone: str = ""
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class PatientCreate(BaseModel):
+    name: str
+    weeks: int
+    trimester: int
+    risk_level: str = "low"
+    language_code: str = "hi"
+    pregnancy_number: int = 1
+    blood_group: str = ""
+    phone: str = ""
+    address: str = ""
+    asha_phone: str = ""
+
+class PatientUpdate(BaseModel):
+    name: str | None = None
+    weeks: int | None = None
+    trimester: int | None = None
+    risk_level: str | None = None
+    language_code: str | None = None
+    pregnancy_number: int | None = None
+    blood_group: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    asha_phone: str | None = None
+
+class PrescriptionCreate(BaseModel):
+    medicine_name: str
+    frequency: str = "daily"
+    quantity_supplied: int = 30
+
+
+@app.post("/api/auth/register")
+async def register(req: RegisterRequest):
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    worker = create_asha_worker(req.name, req.email, req.phone, req.password)
+    if not worker:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    token = authenticate_worker(req.email, req.password)
+    return {"token": token, "worker": worker}
+
+
+@app.post("/api/auth/login")
+async def login(req: LoginRequest):
+    token = authenticate_worker(req.email, req.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    worker = get_worker_by_token(token)
+    return {"token": token, "worker": worker}
+
+
+@app.get("/api/auth/me")
+async def get_me(request: Request):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = auth[7:]
+    worker = get_worker_by_token(token)
+    if not worker:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return worker
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        delete_session(auth[7:])
+    return {"status": "logged_out"}
+
+
+# ── Patient CRUD ──
+
+@app.post("/api/patients")
+async def create_patient_endpoint(req: PatientCreate):
+    patient = create_patient_record(
+        name=req.name, weeks=req.weeks, trimester=req.trimester,
+        risk_level=req.risk_level, language_code=req.language_code,
+        pregnancy_number=req.pregnancy_number, blood_group=req.blood_group,
+        phone=req.phone, address=req.address, asha_phone=req.asha_phone,
+    )
+    return patient
+
+
+@app.put("/api/patients/{patient_id}")
+async def update_patient_endpoint(patient_id: int, req: PatientUpdate):
+    existing = get_patient_by_id(patient_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    data = {k: v for k, v in req.model_dump().items() if v is not None}
+    patient = update_patient(patient_id, **data)
+    return patient
+
+
+@app.delete("/api/patients/{patient_id}")
+async def delete_patient_endpoint(patient_id: int):
+    existing = get_patient_by_id(patient_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    delete_patient(patient_id)
+    return {"status": "deleted", "id": patient_id}
+
+
+@app.post("/api/patients/{patient_id}/prescriptions")
+async def add_prescription_endpoint(patient_id: int, req: PrescriptionCreate):
+    existing = get_patient_by_id(patient_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    rx = add_prescription(patient_id, req.medicine_name, req.frequency, req.quantity_supplied)
+    return rx
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

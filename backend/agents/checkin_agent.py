@@ -51,10 +51,18 @@ def _build_followup_prompt(patient: dict, conversation_history: list[dict]) -> s
 Conversation so far:
 {history_text}
 
-Continue the conversation naturally. If she mentioned symptoms, ask for more details.
-If she mentioned medicine, acknowledge it. Keep it warm and short (1-2 sentences).
-If you have enough information about her symptoms, fetal movement, and medicine compliance,
-say something reassuring and end naturally.
+IMPORTANT RULES:
+- NEVER ask if she is okay or fine when she has already described a serious problem (injury, bleeding, fall, pain, etc.). That is redundant and wastes critical time.
+- If she described an emergency or serious symptom (fall, bleeding, broken bone, severe pain, fainting, accident), do NOT keep questioning. Acknowledge the situation, reassure her that help is being contacted immediately, and end the conversation.
+- Do NOT repeat questions she has already answered.
+- If she has given enough information about her current state, do NOT ask more follow-up questions. Summarize and close.
+
+For non-emergency situations:
+- Continue the conversation naturally. If she mentioned mild symptoms, ask for more details.
+- If she mentioned medicine, acknowledge it. Keep it warm and short (1-2 sentences).
+- If you have enough information about her symptoms, fetal movement, and medicine compliance,
+  say something reassuring and end naturally.
+
 Do NOT use markdown or formatting. Plain conversational text only."""
 
 
@@ -69,14 +77,23 @@ def _build_extraction_prompt(patient: dict, conversation_history: list[dict]) ->
 Conversation:
 {history_text}
 
+CRITICAL RULES:
+- Extract the patient's CURRENT health state as of their LATEST message(s).
+- If the patient previously mentioned symptoms but LATER said she is feeling fine, better, recovered, or okay — those symptoms are RESOLVED and must NOT be listed in "symptoms". Only list symptoms the patient is STILL experiencing.
+- Pay close attention to the chronological arc: the most recent messages override earlier ones. A patient saying "I'm fine now" or "I feel better" means previous symptoms have improved.
+- Do NOT infer, assume, or hallucinate symptoms that were not directly mentioned.
+- If the patient said something vague like "I'm not feeling well" or "I feel bad", put that in "concerns" but leave "symptoms" as an empty array — do NOT guess what might be wrong.
+- If something was not discussed at all, use the default/empty value.
+- "mood" should reflect the patient's mood in her LATEST message, not earlier ones.
+
 Return ONLY valid JSON with these fields:
 {{
-    "symptoms": ["list of symptoms mentioned, empty array if none"],
+    "symptoms": ["list of symptoms the patient is CURRENTLY experiencing — empty array if she says she is fine or better now"],
     "fetal_movement": "active/normal/reduced/not_mentioned",
     "medicine_taken": true/false/null,
     "medicine_details": "what she said about medicine, or empty string",
     "mood": "good/okay/worried/distressed",
-    "concerns": "any specific concerns mentioned, or empty string"
+    "concerns": "any specific concerns mentioned in the patient's own words, or empty string"
 }}
 
 Return ONLY the JSON, no other text."""
